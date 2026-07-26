@@ -1,54 +1,69 @@
 #!/usr/bin/env node
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import cors from "cors";
 import dotenv from "dotenv";
-import { GraphQLClient } from "graphql-request";
 import minimist from "minimist";
+import { GraphQLClient } from "graphql-request";
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from
+  "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from
+  "@modelcontextprotocol/sdk/types.js";
 
 import { ShopifyAuth } from "./lib/shopifyAuth.js";
 import { tools } from "./tools/registry.js";
 
-// Parse command line arguments
-const argv = minimist(process.argv.slice(2));
-
-// Load environment variables from .env file (if it exists)
 dotenv.config();
 
-// Define environment variables - from command line or .env file
+const argv = minimist(process.argv.slice(2));
+
 const SHOPIFY_ACCESS_TOKEN =
   argv.accessToken || process.env.SHOPIFY_ACCESS_TOKEN;
+
 const SHOPIFY_CLIENT_ID =
   argv.clientId || process.env.SHOPIFY_CLIENT_ID;
+
 const SHOPIFY_CLIENT_SECRET =
   argv.clientSecret || process.env.SHOPIFY_CLIENT_SECRET;
-const MYSHOPIFY_DOMAIN = argv.domain || process.env.MYSHOPIFY_DOMAIN;
 
-const useClientCredentials = !!(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET);
+const MYSHOPIFY_DOMAIN =
+  argv.domain || process.env.MYSHOPIFY_DOMAIN;
 
-// Store in process.env for backwards compatibility
-process.env.MYSHOPIFY_DOMAIN = MYSHOPIFY_DOMAIN;
+const SHOPIFY_API_VERSION =
+  argv.apiVersion ||
+  process.env.SHOPIFY_API_VERSION ||
+  "2026-01";
 
-// Validate required environment variables
+const MCP_API_KEY = process.env.MCP_API_KEY;
+
+const useClientCredentials = Boolean(
+  SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET,
+);
+
 if (!SHOPIFY_ACCESS_TOKEN && !useClientCredentials) {
-  console.error("Error: Authentication credentials are required.");
-  console.error("");
-  console.error("Option 1 — Static access token (legacy apps):");
-  console.error("  --accessToken=shpat_xxxxx");
-  console.error("");
-  console.error("Option 2 — Client credentials (Dev Dashboard apps, Jan 2026+):");
-  console.error("  --clientId=your_client_id --clientSecret=your_client_secret");
+  console.error("Shopify authentication credentials are required.");
   process.exit(1);
 }
 
 if (!MYSHOPIFY_DOMAIN) {
-  console.error("Error: MYSHOPIFY_DOMAIN is required.");
-  console.error("Please provide it via command line argument or .env file.");
-  console.error("  Command line: --domain=your-store.myshopify.com");
+  console.error("MYSHOPIFY_DOMAIN is required.");
   process.exit(1);
 }
 
-// Resolve access token (client credentials or static)
+if (!MCP_API_KEY) {
+  console.error("MCP_API_KEY is required.");
+  process.exit(1);
+}
+
+process.env.MYSHOPIFY_DOMAIN = MYSHOPIFY_DOMAIN;
+
 let accessToken: string;
 let auth: ShopifyAuth | null = null;
 
@@ -58,6 +73,7 @@ if (useClientCredentials) {
     clientSecret: SHOPIFY_CLIENT_SECRET!,
     shopDomain: MYSHOPIFY_DOMAIN,
   });
+
   accessToken = await auth.initialize();
 } else {
   accessToken = SHOPIFY_ACCESS_TOKEN!;
@@ -65,55 +81,269 @@ if (useClientCredentials) {
 
 process.env.SHOPIFY_ACCESS_TOKEN = accessToken;
 
-// Create Shopify GraphQL client
-const API_VERSION = argv.apiVersion || process.env.SHOPIFY_API_VERSION || "2026-01";
 const shopifyClient = new GraphQLClient(
-  `https://${MYSHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`,
+  `https://${MYSHOPIFY_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
   {
     headers: {
       "X-Shopify-Access-Token": accessToken,
-      "Content-Type": "application/json"
-    }
-  }
+      "Content-Type": "application/json",
+    },
+  },
 );
 
-// Let the auth manager hot-swap the token header on refresh
 if (auth) {
   auth.setGraphQLClient(shopifyClient);
 }
 
-// Initialize all tools with the shared GraphQL client
 for (const tool of tools) {
   tool.initialize(shopifyClient);
 }
 
-// Set up MCP server
-const server = new McpServer({
-  name: "shopify",
-  version: "1.0.0",
-  description:
-    "MCP Server for Shopify API, enabling interaction with store data through GraphQL API"
-});
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: "shopify-customer-support",
+    version: "1.0.0",
+    description:
+      "Read-only Shopify tools for authorised customer-support staff.",
+  });
 
-// Register all tools with the MCP server
-for (const tool of tools) {
-  server.tool(
-    tool.name,
-    tool.schema.shape,
-    async (args) => {
-      const result = await tool.execute(args);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result) }]
-      };
-    }
-  );
+  for (const tool of tools) {
+    server.tool(
+      tool.name,
+      tool.schema.shape,
+      async (args) => {
+        try {
+          const result = await tool.execute(args);
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result),
+              },
+            ],
+          };
+        } catch (error: unknown) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Unknown Shopify error";
+
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: message,
+                }),
+              },
+            ],
+          };
+        }
+      },
+    );
+  }
+
+  return server;
 }
 
-// Start the server
-const transport = new StdioServerTransport();
-server
-  .connect(transport)
-  .then(() => {})
-  .catch((error: unknown) => {
-    console.error("Failed to start Shopify MCP Server:", error);
+function tokenMatches(received: string, expected: string): boolean {
+  const receivedBuffer = Buffer.from(received);
+  const expectedBuffer = Buffer.from(expected);
+
+  if (receivedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(receivedBuffer, expectedBuffer);
+}
+
+function authenticate(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const authorization = req.header("authorization");
+
+  if (!authorization?.startsWith("Bearer ")) {
+    res.status(401).json({
+      error: "Missing bearer token",
+    });
+    return;
+  }
+
+  const receivedToken = authorization.slice("Bearer ".length);
+
+  if (!tokenMatches(receivedToken, MCP_API_KEY!)) {
+    res.status(403).json({
+      error: "Invalid bearer token",
+    });
+    return;
+  }
+
+  next();
+}
+
+type ActiveSession = {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+};
+
+const sessions = new Map<string, ActiveSession>();
+
+const app = express();
+const port = Number(process.env.PORT || 3000);
+
+app.set("trust proxy", 1);
+
+app.use(
+  cors({
+    origin: false,
+    methods: ["GET", "POST", "DELETE"],
+    allowedHeaders: [
+      "authorization",
+      "content-type",
+      "mcp-session-id",
+      "mcp-protocol-version",
+      "last-event-id",
+    ],
+    exposedHeaders: [
+      "mcp-session-id",
+      "mcp-protocol-version",
+    ],
+  }),
+);
+
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "shopify-customer-support-mcp",
   });
+});
+
+app.post(
+  "/mcp",
+  authenticate,
+  async (req: Request, res: Response) => {
+    try {
+      const sessionId = req.header("mcp-session-id");
+
+      if (sessionId) {
+        const session = sessions.get(sessionId);
+
+        if (!session) {
+          res.status(404).json({
+            error: "Unknown MCP session",
+          });
+          return;
+        }
+
+        await session.transport.handleRequest(req, res, req.body);
+        return;
+      }
+
+      if (!isInitializeRequest(req.body)) {
+        res.status(400).json({
+          error: "MCP session has not been initialised",
+        });
+        return;
+      }
+
+      const server = createMcpServer();
+
+      let transport: StreamableHTTPServerTransport;
+
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+
+        onsessioninitialized: (newSessionId: string) => {
+          sessions.set(newSessionId, {
+            server,
+            transport,
+          });
+        },
+      });
+
+      transport.onclose = () => {
+        const currentSessionId = transport.sessionId;
+
+        if (currentSessionId) {
+          sessions.delete(currentSessionId);
+        }
+      };
+
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error: unknown) {
+      console.error("MCP request failed:", error);
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Internal MCP server error",
+        });
+      }
+    }
+  },
+);
+
+app.get(
+  "/mcp",
+  authenticate,
+  async (req: Request, res: Response) => {
+    const sessionId = req.header("mcp-session-id");
+
+    if (!sessionId) {
+      res.status(400).json({
+        error: "Missing MCP session ID",
+      });
+      return;
+    }
+
+    const session = sessions.get(sessionId);
+
+    if (!session) {
+      res.status(404).json({
+        error: "Unknown MCP session",
+      });
+      return;
+    }
+
+    await session.transport.handleRequest(req, res);
+  },
+);
+
+app.delete(
+  "/mcp",
+  authenticate,
+  async (req: Request, res: Response) => {
+    const sessionId = req.header("mcp-session-id");
+
+    if (!sessionId) {
+      res.status(400).json({
+        error: "Missing MCP session ID",
+      });
+      return;
+    }
+
+    const session = sessions.get(sessionId);
+
+    if (!session) {
+      res.status(404).json({
+        error: "Unknown MCP session",
+      });
+      return;
+    }
+
+    await session.transport.handleRequest(req, res);
+    sessions.delete(sessionId);
+  },
+);
+
+app.listen(port, "0.0.0.0", () => {
+  console.log(
+    `Shopify support MCP running at http://localhost:${port}`,
+  );
+});
